@@ -20,11 +20,14 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
+import java.security.InvalidKeyException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 
 import static okio.Util.checkOffsetAndCount;
 import static okio.Util.reverseBytesLong;
@@ -639,14 +642,22 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   }
 
   @Override public String readUtf8LineStrict() throws EOFException {
-    long newline = indexOf((byte) '\n');
-    if (newline == -1) {
-      Buffer data = new Buffer();
-      copyTo(data, 0, Math.min(32, size));
-      throw new EOFException("\\n not found: size=" + size()
-          + " content=" + data.readByteString().hex() + "…");
+    return readUtf8LineStrict(Long.MAX_VALUE);
+  }
+
+  @Override public String readUtf8LineStrict(long limit) throws EOFException {
+    if (limit < 0) throw new IllegalArgumentException("limit < 0: " + limit);
+    long scanLength = limit == Long.MAX_VALUE ? Long.MAX_VALUE : limit + 1;
+    long newline = indexOf((byte) '\n', 0, scanLength);
+    if (newline != -1) return readUtf8Line(newline);
+    if (scanLength < size()
+        && getByte(scanLength - 1) == '\r' && getByte(scanLength) == '\n') {
+      return readUtf8Line(scanLength); // The line was 'limit' UTF-8 bytes followed by \r\n.
     }
-    return readUtf8Line(newline);
+    Buffer data = new Buffer();
+    copyTo(data, 0, Math.min(32, size()));
+    throw new EOFException("\\n not found: limit=" + Math.min(size(), limit)
+        + " content=" + data.readByteString().hex() + '…');
   }
 
   String readUtf8Line(long newline) throws EOFException {
@@ -1260,7 +1271,7 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
   }
 
   @Override public long indexOf(byte b) {
-    return indexOf(b, 0);
+    return indexOf(b, 0, Long.MAX_VALUE);
   }
 
   /**
@@ -1268,7 +1279,17 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
    * -1 if this buffer does not contain {@code b} in that range.
    */
   @Override public long indexOf(byte b, long fromIndex) {
-    if (fromIndex < 0) throw new IllegalArgumentException("fromIndex < 0");
+    return indexOf(b, fromIndex, Long.MAX_VALUE);
+  }
+
+  @Override public long indexOf(byte b, long fromIndex, long toIndex) {
+    if (fromIndex < 0 || toIndex < fromIndex) {
+      throw new IllegalArgumentException(
+          String.format("size=%s fromIndex=%s toIndex=%s", size, fromIndex, toIndex));
+    }
+
+    if (toIndex > size) toIndex = size;
+    if (fromIndex == toIndex) return -1L;
 
     Segment s;
     long offset;
@@ -1298,9 +1319,11 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     }
 
     // Scan through the segments, searching for b.
-    while (offset < size) {
+    while (offset < toIndex) {
       byte[] data = s.data;
-      for (int pos = (int) (s.pos + fromIndex - offset), limit = s.limit; pos < limit; pos++) {
+      int limit = (int) Math.min(s.limit, s.pos + toIndex - offset);
+      int pos = (int) (s.pos + fromIndex - offset);
+      for (; pos < limit; pos++) {
         if (data[pos] == b) {
           return pos - s.pos + offset;
         }
@@ -1535,16 +1558,56 @@ public final class Buffer implements BufferedSource, BufferedSink, Cloneable {
     return digest("SHA-256");
   }
 
+  /** Returns the 512-bit SHA-512 hash of this buffer. */
+  public ByteString sha512() {
+      return digest("SHA-512");
+  }
+
   private ByteString digest(String algorithm) {
     try {
       MessageDigest messageDigest = MessageDigest.getInstance(algorithm);
-      messageDigest.update(head.data, head.pos, head.limit - head.pos);
-      for (Segment s = head.next; s != head; s = s.next) {
-        messageDigest.update(s.data, s.pos, s.limit - s.pos);
+      if (head != null) {
+        messageDigest.update(head.data, head.pos, head.limit - head.pos);
+        for (Segment s = head.next; s != head; s = s.next) {
+          messageDigest.update(s.data, s.pos, s.limit - s.pos);
+        }
       }
       return ByteString.of(messageDigest.digest());
     } catch (NoSuchAlgorithmException e) {
       throw new AssertionError();
+    }
+  }
+
+  /** Returns the 160-bit SHA-1 HMAC of this buffer. */
+  public ByteString hmacSha1(ByteString key) {
+    return hmac("HmacSHA1", key);
+  }
+
+  /** Returns the 256-bit SHA-256 HMAC of this buffer. */
+  public ByteString hmacSha256(ByteString key) {
+    return hmac("HmacSHA256", key);
+  }
+
+  /** Returns the 512-bit SHA-512 HMAC of this buffer. */
+  public ByteString hmacSha512(ByteString key) {
+      return hmac("HmacSHA512", key);
+  }
+
+  private ByteString hmac(String algorithm, ByteString key) {
+    try {
+      Mac mac = Mac.getInstance(algorithm);
+      mac.init(new SecretKeySpec(key.toByteArray(), algorithm));
+      if (head != null) {
+        mac.update(head.data, head.pos, head.limit - head.pos);
+        for (Segment s = head.next; s != head; s = s.next) {
+          mac.update(s.data, s.pos, s.limit - s.pos);
+        }
+      }
+      return ByteString.of(mac.doFinal());
+    } catch (NoSuchAlgorithmException e) {
+      throw new AssertionError();
+    } catch (InvalidKeyException e) {
+      throw new IllegalArgumentException(e);
     }
   }
 
